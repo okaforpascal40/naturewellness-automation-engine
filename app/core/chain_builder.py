@@ -76,16 +76,22 @@ async def _fetch_foods(compound_name: str) -> list[FoodCompoundMapping]:
 
 
 async def _fetch_foods_foodb(compound_name: str) -> list[FoodCompoundMapping]:
+    logger.debug("Searching FooDB for compound: %s", compound_name)
     try:
-        return await foodb.search_foods_by_compound(compound_name)
+        results = await foodb.search_foods_by_compound(compound_name)
+        logger.debug("FooDB returned %d result(s) for '%s'", len(results), compound_name)
+        return results
     except Exception as exc:
         logger.warning("FooDB food fetch failed for '%s': %s", compound_name, exc)
         return []
 
 
 async def _fetch_foods_usda(compound_name: str) -> list[FoodCompoundMapping]:
+    logger.debug("Searching USDA for compound: %s", compound_name)
     try:
-        return await usda.search_foods_by_compound(compound_name)
+        results = await usda.search_foods_by_compound(compound_name)
+        logger.debug("USDA returned %d result(s) for '%s'", len(results), compound_name)
+        return results
     except Exception as exc:
         logger.warning("USDA food fetch failed for '%s': %s", compound_name, exc)
         return []

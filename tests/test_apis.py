@@ -348,7 +348,7 @@ async def test_foodb_returns_foods() -> None:
     responses = [_make_mock(compound_search_response), _make_mock(foods_response)]
     call_count = 0
 
-    async def mock_get(url: str, params: dict | None = None) -> MagicMock:
+    async def mock_get(url: str, *, params: dict | None = None, **kwargs: object) -> MagicMock:
         nonlocal call_count
         result = responses[call_count]
         call_count += 1
@@ -401,7 +401,7 @@ async def test_foodb_prefers_exact_name_match() -> None:
 
     responses = iter([compound_search_response, foods_response])
 
-    async def mock_get(url: str, params: dict | None = None) -> MagicMock:
+    async def mock_get(url: str, *, params: dict | None = None, **kwargs: object) -> MagicMock:
         m = MagicMock(spec=httpx.Response)
         m.status_code = 200
         m.raise_for_status = MagicMock()

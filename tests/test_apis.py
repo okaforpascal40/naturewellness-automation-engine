@@ -321,6 +321,145 @@ async def test_run_automation_endpoint_mocked() -> None:
     assert data["genes_found"] == 3
 
 
+# ── FooDB API unit tests ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_foodb_returns_foods() -> None:
+    """Happy path: compound found, foods returned with source='foodb'."""
+    from app.api.foodb import search_foods_by_compound
+
+    compound_search_response = [
+        {"id": 702, "name": "Quercetin", "public_id": "FDB000166"},
+    ]
+    foods_response = [
+        {"id": 15, "name": "Apple", "concentration_avg": 4.42, "concentration_unit": "mg/100g"},
+        {"id": 31, "name": "Onion", "concentration_avg": 19.93, "concentration_unit": "mg/100g"},
+    ]
+
+    import httpx
+
+    def _make_mock(payload: list) -> MagicMock:
+        m = MagicMock(spec=httpx.Response)
+        m.status_code = 200
+        m.raise_for_status = MagicMock()
+        m.json.return_value = payload
+        return m
+
+    responses = [_make_mock(compound_search_response), _make_mock(foods_response)]
+    call_count = 0
+
+    async def mock_get(url: str, params: dict | None = None) -> MagicMock:
+        nonlocal call_count
+        result = responses[call_count]
+        call_count += 1
+        return result
+
+    with patch("asyncio.sleep", new=AsyncMock()):  # skip rate-limit delay in tests
+        with patch("httpx.AsyncClient.get", new=mock_get):
+            results = await search_foods_by_compound("quercetin", limit=10)
+
+    assert len(results) == 2
+    assert results[0].food_name == "Apple"
+    assert results[0].compound_name == "quercetin"
+    assert results[0].source == "foodb"
+    assert results[0].compound_amount == 4.42
+    assert results[1].food_name == "Onion"
+
+
+@pytest.mark.asyncio
+async def test_foodb_compound_not_found_returns_empty() -> None:
+    """Empty compound search yields [] without raising."""
+    from app.api.foodb import search_foods_by_compound
+
+    import httpx
+
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = []  # FooDB found nothing
+
+    with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=mock_resp)):
+        results = await search_foods_by_compound("unknownxyz123", limit=10)
+
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_foodb_prefers_exact_name_match() -> None:
+    """When FooDB returns multiple compounds, the exact-name match is used."""
+    from app.api.foodb import search_foods_by_compound
+
+    compound_search_response = [
+        {"id": 1, "name": "Quercetin-3-glucoside"},   # first result, not exact
+        {"id": 702, "name": "Quercetin"},              # exact match
+    ]
+    foods_response = [
+        {"id": 15, "name": "Apple", "concentration_avg": None, "concentration_unit": None},
+    ]
+
+    import httpx
+
+    responses = iter([compound_search_response, foods_response])
+
+    async def mock_get(url: str, params: dict | None = None) -> MagicMock:
+        m = MagicMock(spec=httpx.Response)
+        m.status_code = 200
+        m.raise_for_status = MagicMock()
+        m.json.return_value = next(responses)
+        return m
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with patch("httpx.AsyncClient.get", new=mock_get):
+            results = await search_foods_by_compound("Quercetin", limit=10)
+
+    # compound_id=702 (exact match) should have been used, not id=1
+    assert len(results) == 1
+    assert results[0].food_name == "Apple"
+    assert results[0].compound_amount is None  # gracefully handled
+
+
+@pytest.mark.asyncio
+async def test_chain_builder_combines_foodb_and_usda() -> None:
+    """_fetch_foods returns combined results from both FooDB and USDA."""
+    from app.core.chain_builder import _fetch_foods
+    from app.models import FoodCompoundMapping
+
+    foodb_food = FoodCompoundMapping(
+        food_id="15", food_name="Apple", compound_name="Quercetin",
+        compound_amount=4.42, compound_unit="mg/100g", source="foodb",
+    )
+    usda_food = FoodCompoundMapping(
+        food_id="170383", food_name="Apples, raw, with skin", compound_name="Quercetin",
+        compound_amount=4.42, compound_unit="mg", source="usda",
+    )
+
+    with patch("app.core.chain_builder._fetch_foods_foodb", new=AsyncMock(return_value=[foodb_food])):
+        with patch("app.core.chain_builder._fetch_foods_usda", new=AsyncMock(return_value=[usda_food])):
+            results = await _fetch_foods("Quercetin")
+
+    assert len(results) == 2
+    sources = {r.source for r in results}
+    assert sources == {"foodb", "usda"}
+
+
+@pytest.mark.asyncio
+async def test_chain_builder_deduplicates_same_source() -> None:
+    """Duplicate (food_name, source) entries are collapsed."""
+    from app.core.chain_builder import _fetch_foods
+    from app.models import FoodCompoundMapping
+
+    duplicate = FoodCompoundMapping(
+        food_id="15", food_name="Apple", compound_name="Quercetin",
+        source="foodb",
+    )
+
+    with patch("app.core.chain_builder._fetch_foods_foodb", new=AsyncMock(return_value=[duplicate, duplicate])):
+        with patch("app.core.chain_builder._fetch_foods_usda", new=AsyncMock(return_value=[])):
+            results = await _fetch_foods("Quercetin")
+
+    assert len(results) == 1
+
+
 # ── Manual review endpoint tests ──────────────────────────────────────────────
 
 @pytest.mark.asyncio

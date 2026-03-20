@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     reactome_api_url: str = "https://reactome.org/ContentService"
     chembl_api_url: str = "https://www.ebi.ac.uk/chembl/api/data"
     usda_api_key: str = ""
+    foodb_api_url: str = "https://foodb.ca"
 
     # App
     app_env: str = "development"

@@ -9,7 +9,7 @@ import asyncio
 import logging
 from typing import Any
 
-from app.api import chembl, disgenet, reactome, usda
+from app.api import chembl, disgenet, foodb, reactome, usda
 from app.core.evidence_scoring import EvidenceChain, compute_evidence_score, rank_evidence_scores
 from app.models import (
     AutomationRunRequest,
@@ -41,10 +41,53 @@ async def _fetch_compounds(gene: DiseaseGeneAssociation) -> list[CompoundGeneInt
 
 
 async def _fetch_foods(compound_name: str) -> list[FoodCompoundMapping]:
+    """Fetch foods from FooDB and USDA concurrently and combine results.
+
+    FooDB covers bioactive phytochemicals (quercetin, resveratrol, etc.)
+    that are often absent from USDA.  USDA is authoritative for macronutrients
+    and common micronutrients.  Running both in parallel maximises coverage
+    without adding latency.
+    """
+    foodb_task = asyncio.create_task(_fetch_foods_foodb(compound_name))
+    usda_task = asyncio.create_task(_fetch_foods_usda(compound_name))
+
+    foodb_results, usda_results = await asyncio.gather(foodb_task, usda_task)
+
+    # Deduplicate by (food_name, source) so the same food from the same
+    # source never appears twice, while still keeping FooDB and USDA entries
+    # for the same real-world food (they carry different metadata).
+    seen: set[tuple[str, str]] = set()
+    combined: list[FoodCompoundMapping] = []
+    for mapping in foodb_results + usda_results:
+        key = (mapping.food_name.lower(), mapping.source)
+        if key not in seen:
+            seen.add(key)
+            combined.append(mapping)
+
+    if combined:
+        logger.debug(
+            "Foods for '%s': %d FooDB + %d USDA = %d combined",
+            compound_name,
+            len(foodb_results),
+            len(usda_results),
+            len(combined),
+        )
+    return combined
+
+
+async def _fetch_foods_foodb(compound_name: str) -> list[FoodCompoundMapping]:
+    try:
+        return await foodb.search_foods_by_compound(compound_name)
+    except Exception as exc:
+        logger.warning("FooDB food fetch failed for '%s': %s", compound_name, exc)
+        return []
+
+
+async def _fetch_foods_usda(compound_name: str) -> list[FoodCompoundMapping]:
     try:
         return await usda.search_foods_by_compound(compound_name)
     except Exception as exc:
-        logger.warning("Food fetch failed for compound %s: %s", compound_name, exc)
+        logger.warning("USDA food fetch failed for '%s': %s", compound_name, exc)
         return []
 
 

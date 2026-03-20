@@ -48,10 +48,10 @@ async def _fetch_foods(compound_name: str) -> list[FoodCompoundMapping]:
     and common micronutrients.  Running both in parallel maximises coverage
     without adding latency.
     """
-    foodb_task = asyncio.create_task(_fetch_foods_foodb(compound_name))
-    usda_task = asyncio.create_task(_fetch_foods_usda(compound_name))
-
-    foodb_results, usda_results = await asyncio.gather(foodb_task, usda_task)
+    foodb_results, usda_results = await asyncio.gather(
+        _fetch_foods_foodb(compound_name),
+        _fetch_foods_usda(compound_name),
+    )
 
     # Deduplicate by (food_name, source) so the same food from the same
     # source never appears twice, while still keeping FooDB and USDA entries
@@ -76,7 +76,7 @@ async def _fetch_foods(compound_name: str) -> list[FoodCompoundMapping]:
 
 
 async def _fetch_foods_foodb(compound_name: str) -> list[FoodCompoundMapping]:
-    logger.debug("Searching FooDB for compound: %s", compound_name)
+    logger.info("_fetch_foods_foodb called with compound: %s", compound_name)
     try:
         results = await foodb.search_foods_by_compound(compound_name)
         logger.debug("FooDB returned %d result(s) for '%s'", len(results), compound_name)
@@ -87,7 +87,7 @@ async def _fetch_foods_foodb(compound_name: str) -> list[FoodCompoundMapping]:
 
 
 async def _fetch_foods_usda(compound_name: str) -> list[FoodCompoundMapping]:
-    logger.debug("Searching USDA for compound: %s", compound_name)
+    logger.info("_fetch_foods_usda called with compound: %s", compound_name)
     try:
         results = await usda.search_foods_by_compound(compound_name)
         logger.debug("USDA returned %d result(s) for '%s'", len(results), compound_name)

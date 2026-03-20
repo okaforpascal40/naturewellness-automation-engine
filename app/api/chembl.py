@@ -167,11 +167,18 @@ async def _filter_natural_products(
     client: httpx.AsyncClient,
     molecule_ids: list[str],
 ) -> dict[str, str]:
-    """Query the molecule endpoint and return {chembl_id: pref_name} for natural products.
+    """Fetch molecule records and return {chembl_id: pref_name} for natural products.
 
-    Filters applied:
-      - molecule_properties__natural_product = 1  (ChEMBL natural product flag)
-      - max_phase < _MAX_PHASE_CUTOFF             (exclude late-stage clinical drugs)
+    Filtering is done client-side after fetching, because the ChEMBL molecule
+    endpoint rejects molecule_properties__natural_product and max_phase__lt as
+    query parameters with a 400 error.
+
+    Rules (each field is checked only when present in the response):
+      - molecule_properties.natural_product == 1  → keep
+      - molecule_properties.natural_product == 0  → skip (confirmed synthetic)
+      - field absent                              → accept (data not available)
+      - max_phase >= _MAX_PHASE_CUTOFF            → skip (late-stage drug)
+      - max_phase < _MAX_PHASE_CUTOFF or None     → accept
     """
     if not molecule_ids:
         return {}
@@ -179,8 +186,6 @@ async def _filter_natural_products(
     url = f"{_base_url()}/molecule.json"
     params = {
         "molecule_chembl_id__in": ",".join(molecule_ids),
-        "molecule_properties__natural_product": 1,
-        f"max_phase__lt": _MAX_PHASE_CUTOFF,
         "limit": len(molecule_ids),
         "format": "json",
     }
@@ -189,7 +194,7 @@ async def _filter_natural_products(
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         logger.error(
-            "ChEMBL molecule filter request failed [%s]: %s",
+            "ChEMBL molecule fetch failed [%s]: %s",
             exc.response.status_code,
             exc.response.text,
         )
@@ -197,11 +202,38 @@ async def _filter_natural_products(
 
     # ChEMBL envelope: {"molecules": [...], "page_meta": {...}}
     molecules: list[Any] = resp.json().get("molecules", [])
-    return {
-        m["molecule_chembl_id"]: m.get("pref_name") or m["molecule_chembl_id"]
-        for m in molecules
-        if isinstance(m, dict) and m.get("molecule_chembl_id")
-    }
+
+    result: dict[str, str] = {}
+    for m in molecules:
+        if not isinstance(m, dict):
+            continue
+        chembl_id: str | None = m.get("molecule_chembl_id")
+        if not chembl_id:
+            continue
+
+        # --- natural_product flag ---
+        props: dict[str, Any] = m.get("molecule_properties") or {}
+        np_flag = props.get("natural_product")
+        if np_flag is not None and int(np_flag) != 1:
+            logger.debug("Skipping %s — confirmed synthetic (natural_product=%s)", chembl_id, np_flag)
+            continue
+
+        # --- max_phase filter ---
+        max_phase = m.get("max_phase")
+        if max_phase is not None:
+            try:
+                if float(max_phase) >= _MAX_PHASE_CUTOFF:
+                    logger.debug("Skipping %s — max_phase=%s", chembl_id, max_phase)
+                    continue
+            except (TypeError, ValueError):
+                pass  # unparseable max_phase → accept
+
+        result[chembl_id] = m.get("pref_name") or chembl_id
+
+    logger.debug(
+        "Natural product filter: %d/%d molecules passed", len(result), len(molecules)
+    )
+    return result
 
 
 def _safe_float(value: Any) -> float | None:

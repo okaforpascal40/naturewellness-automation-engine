@@ -85,11 +85,22 @@ async def get_compounds_for_gene(
         compound_id = act.get("molecule_chembl_id")
         if not compound_id:
             continue
+        # molecule_pref_name is the human-readable name (e.g. "Quercetin").
+        # compound_name does not exist in ChEMBL activity responses.
+        # Skip compounds with no preferred name — a bare ChEMBL ID is not
+        # searchable in USDA and would produce empty results downstream.
+        compound_name: str | None = act.get("molecule_pref_name")
+        if not compound_name:
+            logger.debug(
+                "Skipping ChEMBL compound %s — no preferred name available",
+                compound_id,
+            )
+            continue
         try:
             interactions.append(
                 CompoundGeneInteraction(
                     compound_id=compound_id,
-                    compound_name=act.get("compound_name") or compound_id,
+                    compound_name=compound_name,
                     gene_id=gene_id,
                     gene_symbol=gene_symbol,
                     activity_type=act.get("standard_type"),

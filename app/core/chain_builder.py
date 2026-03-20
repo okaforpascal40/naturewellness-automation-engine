@@ -91,7 +91,19 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
         return _empty_response(run_id, request, genes, all_pathways)
 
     # Step 3: Compounds → Foods (concurrent)
-    unique_compound_names = list({c.compound_name for c in all_compounds})
+    # Guard: exclude any compound whose name is still a bare database ID
+    # (e.g. "CHEMBL360610").  These slip through when ChEMBL has no
+    # molecule_pref_name and would produce zero USDA results.
+    unique_compound_names = list({
+        c.compound_name
+        for c in all_compounds
+        if not c.compound_name.upper().startswith("CHEMBL")
+    })
+    if len(unique_compound_names) < len({c.compound_name for c in all_compounds}):
+        logger.warning(
+            "Dropped %d compound(s) with no human-readable name before USDA search",
+            len({c.compound_name for c in all_compounds}) - len(unique_compound_names),
+        )
     food_tasks = [_fetch_foods(name) for name in unique_compound_names]
     food_results: list[list[FoodCompoundMapping]] = await asyncio.gather(*food_tasks)
     all_foods: list[FoodCompoundMapping] = [f for fs in food_results for f in fs]

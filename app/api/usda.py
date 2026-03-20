@@ -21,11 +21,29 @@ def _api_key() -> str:
     return get_settings().usda_api_key
 
 
+def _looks_like_db_id(name: str) -> bool:
+    """Return True if the name appears to be a database identifier, not a compound name."""
+    upper = name.upper()
+    return upper.startswith("CHEMBL") or upper.startswith("CHEBI:") or upper.startswith("DB")
+
+
 async def search_foods_by_compound(
     compound_name: str,
     page_size: int = 10,
 ) -> list[FoodCompoundMapping]:
-    """Search USDA FoodData Central for foods containing a given compound/nutrient."""
+    """Search USDA FoodData Central for foods containing a given compound/nutrient.
+
+    Expects a human-readable compound name such as "quercetin" or "resveratrol".
+    Database IDs (e.g. "CHEMBL360610") are rejected immediately.
+    """
+    if _looks_like_db_id(compound_name):
+        logger.warning(
+            "USDA search received a database ID ('%s') instead of a compound name — "
+            "skipping.  Fix the upstream caller to pass a human-readable name.",
+            compound_name,
+        )
+        return []
+
     url = f"{_BASE_URL}/foods/search"
     params = {
         "query": compound_name,

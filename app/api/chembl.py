@@ -48,9 +48,9 @@ async def get_compounds_for_gene(
             )
             raise
 
-        targets: list[Any] = (
-            target_resp.json().get("targets", {}).get("target", [])
-        )
+        # ChEMBL envelope: {"targets": [...], "page_meta": {...}}
+        # "targets" is a plain list, not a nested dict.
+        targets: list[Any] = target_resp.json().get("targets", [])
         if not targets:
             logger.info("No ChEMBL targets found for gene %s", gene_symbol)
             return []
@@ -76,7 +76,9 @@ async def get_compounds_for_gene(
             )
             raise
 
-    activities: list[Any] = act_resp.json().get("activities", {}).get("activity", [])
+    # ChEMBL envelope: {"activities": [...], "page_meta": {...}}
+    # "activities" is a plain list, not a nested dict.
+    activities: list[Any] = act_resp.json().get("activities", [])
     interactions: list[CompoundGeneInteraction] = []
 
     for act in activities:

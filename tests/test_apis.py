@@ -303,7 +303,8 @@ async def test_run_automation_endpoint_mocked() -> None:
     )
 
     with patch("app.routers.automation.run_pipeline", new=AsyncMock(return_value=mock_response)):
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        from httpx import ASGITransport
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post(
                 "/api/v1/automation/run",
                 json={
@@ -337,7 +338,8 @@ async def test_create_review_mocked() -> None:
     }
 
     with patch("app.routers.manual_review.insert_record", new=AsyncMock(return_value=mock_row)):
-        async with AsyncClient(app=app, base_url="http://test") as client:
+        from httpx import ASGITransport
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post(
                 "/api/v1/review/",
                 params={"evidence_score_id": "score-abc"},

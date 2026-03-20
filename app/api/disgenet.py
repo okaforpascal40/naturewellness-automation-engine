@@ -1,6 +1,7 @@
-"""DisGeNET API integration.
+"""Open Targets Platform API integration (replaces DisGeNET).
 
-Docs: https://disgenet.com/api
+Docs: https://platform-docs.opentargets.org/data-access/graphql-api
+GraphQL endpoint — no API key required.
 """
 from __future__ import annotations
 
@@ -9,19 +10,58 @@ from typing import Any
 
 import httpx
 
-from app.config import get_settings
 from app.models import DiseaseGeneAssociation
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://api.disgenet.com/api/v1"
+_GRAPHQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
 
-
-def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {get_settings().disgenet_api_key}",
-        "Content-Type": "application/json",
+# Returns disease metadata + paginated target associations with overall scores.
+_DISEASE_TARGETS_QUERY = """
+query DiseaseTargets($diseaseId: String!, $page: Int!, $pageSize: Int!) {
+  disease(efoId: $diseaseId) {
+    id
+    name
+    associatedTargets(page: { index: $page, size: $pageSize }) {
+      count
+      rows {
+        target {
+          id
+          approvedSymbol
+          approvedName
+        }
+        score
+      }
     }
+  }
+}
+"""
+
+
+async def _run_query(
+    client: httpx.AsyncClient,
+    query: str,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    response = await client.post(
+        _GRAPHQL_URL,
+        json={"query": query, "variables": variables},
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Open Targets GraphQL request failed [%s]: %s",
+            exc.response.status_code,
+            exc.response.text,
+        )
+        raise
+    payload: dict[str, Any] = response.json()
+    if "errors" in payload:
+        logger.error("Open Targets GraphQL errors: %s", payload["errors"])
+        raise ValueError(f"GraphQL errors: {payload['errors']}")
+    return payload.get("data", {})
 
 
 async def get_disease_gene_associations(
@@ -29,42 +69,70 @@ async def get_disease_gene_associations(
     min_score: float = 0.3,
     limit: int = 10,
 ) -> list[DiseaseGeneAssociation]:
-    """Fetch gene–disease associations from DisGeNET for a given disease UMLS ID."""
-    url = f"{_BASE_URL}/gda/disease/{disease_id}"
-    params: dict[str, Any] = {
-        "min_score": min_score,
-        "limit": limit,
-        "format": "json",
-    }
+    """Fetch gene–disease associations from Open Targets for a given EFO disease ID.
+
+    Args:
+        disease_id: EFO identifier (e.g. "EFO_0000400" for type 2 diabetes).
+        min_score: Minimum overall association score in [0, 1].
+        limit: Maximum number of associations to return.
+    """
+    associations: list[DiseaseGeneAssociation] = []
+    page_size = min(limit, 50)  # Open Targets caps at 50 per page
+    page = 0
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.get(url, headers=_headers(), params=params)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "DisGeNET request failed [%s]: %s",
-                exc.response.status_code,
-                exc.response.text,
+        while len(associations) < limit:
+            data = await _run_query(
+                client,
+                _DISEASE_TARGETS_QUERY,
+                {"diseaseId": disease_id, "page": page, "pageSize": page_size},
             )
-            raise
 
-    payload: dict[str, Any] = response.json()
-    associations: list[DiseaseGeneAssociation] = []
-
-    for item in payload.get("payload", []):
-        try:
-            associations.append(
-                DiseaseGeneAssociation(
-                    disease_id=disease_id,
-                    disease_name=item.get("disease_name", ""),
-                    gene_id=str(item.get("gene_ncbi_id", "")),
-                    gene_symbol=item.get("gene_symbol", ""),
-                    score=float(item.get("score", 0.0)),
-                    source="disgenet",
+            disease_data: dict[str, Any] | None = data.get("disease")
+            if not disease_data:
+                logger.warning(
+                    "Open Targets returned no disease data for id '%s'", disease_id
                 )
-            )
-        except Exception:
-            logger.warning("Skipping malformed DisGeNET record: %s", item)
+                break
+
+            disease_name: str = disease_data.get("name", disease_id)
+            associated = disease_data.get("associatedTargets", {})
+            rows: list[dict[str, Any]] = associated.get("rows", [])
+            total: int = associated.get("count", 0)
+
+            if not rows:
+                break
+
+            for row in rows:
+                if len(associations) >= limit:
+                    break
+
+                score = float(row.get("score", 0.0))
+                if score < min_score:
+                    continue
+
+                target = row.get("target", {})
+                try:
+                    associations.append(
+                        DiseaseGeneAssociation(
+                            disease_id=disease_id,
+                            disease_name=disease_name,
+                            gene_id=target.get("id", ""),
+                            gene_symbol=target.get("approvedSymbol", ""),
+                            score=score,
+                            source="open_targets",
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Skipping malformed Open Targets association row: %s", row
+                    )
+
+            # Stop if we have fetched all available results
+            fetched_so_far = (page + 1) * page_size
+            if fetched_so_far >= total or len(rows) < page_size:
+                break
+
+            page += 1
 
     return associations

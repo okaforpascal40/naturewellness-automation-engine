@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     supabase_service_key: str = ""
 
     # External APIs
-    disgenet_api_key: str = ""
+    open_targets_api_url: str = "https://api.platform.opentargets.org/api/v4/graphql"
     reactome_api_url: str = "https://reactome.org/ContentService"
     chembl_api_url: str = "https://www.ebi.ac.uk/chembl/api/data"
     usda_api_key: str = ""

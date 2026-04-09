@@ -74,6 +74,26 @@ async def list_reviews(
 
 
 @router.get(
+    "/pending/count",
+    response_model=dict,
+    summary="Count pending reviews",
+)
+async def pending_count() -> dict:
+    try:
+        rows = await fetch_records(
+            "review_records",
+            filters={"status": ManualReviewStatus.pending.value},
+            limit=1000,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database error: {exc}",
+        ) from exc
+    return {"pending": len(rows)}
+
+
+@router.get(
     "/{review_id}",
     response_model=ReviewRecord,
     summary="Get a single review record",
@@ -116,23 +136,3 @@ async def update_review(review_id: str, body: ReviewUpdateRequest) -> ReviewReco
             detail=f"Database error: {exc}",
         ) from exc
     return ReviewRecord(**row)
-
-
-@router.get(
-    "/pending/count",
-    response_model=dict,
-    summary="Count pending reviews",
-)
-async def pending_count() -> dict:
-    try:
-        rows = await fetch_records(
-            "review_records",
-            filters={"status": ManualReviewStatus.pending.value},
-            limit=1000,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Database error: {exc}",
-        ) from exc
-    return {"pending": len(rows)}

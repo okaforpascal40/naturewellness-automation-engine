@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 @lru_cache
 def _get_client_params() -> tuple[str, str]:
     settings = get_settings()
-    return settings.supabase_url, settings.supabase_service_key
+    return settings.supabase_url, settings.supabase_key
 
 
 async def get_supabase() -> AsyncClient:
@@ -22,7 +22,7 @@ async def get_supabase() -> AsyncClient:
     url, key = _get_client_params()
     if not url or not key:
         raise RuntimeError(
-            "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment"
+            "SUPABASE_URL and SUPABASE_KEY must be set in environment"
         )
     return await acreate_client(url, key)
 

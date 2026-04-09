@@ -1,7 +1,13 @@
 """Disease → Gene → Pathway → Compound → Food pipeline.
 
-Orchestrates calls to the four external APIs and assembles
-EvidenceChain objects ready for scoring.
+Hybrid architecture:
+  - Genes:              Open Targets API (automated, live)
+  - Pathways/Compounds/Foods: Supabase curated database (supabase_matcher)
+  - Evidence scoring:   Automated
+
+All external API dependencies (ChEMBL, KEGG, Reactome, FooDB, USDA, HMDB)
+have been replaced with Supabase queries so the pipeline only makes one
+external call (Open Targets) before consulting the curated local database.
 """
 from __future__ import annotations
 
@@ -9,7 +15,7 @@ import asyncio
 import logging
 from typing import Any
 
-from app.api import chembl, disgenet, foodb, reactome, usda
+from app.api import disgenet, supabase_matcher
 from app.core.evidence_scoring import EvidenceChain, compute_evidence_score, rank_evidence_scores
 from app.models import (
     AutomationRunRequest,
@@ -24,79 +30,6 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 
-async def _fetch_pathways(gene: DiseaseGeneAssociation) -> list[GenePathwayMapping]:
-    try:
-        return await reactome.get_pathways_for_gene(gene.gene_symbol, gene.gene_id)
-    except Exception as exc:
-        logger.warning("Pathway fetch failed for %s: %s", gene.gene_symbol, exc)
-        return []
-
-
-async def _fetch_compounds(gene: DiseaseGeneAssociation) -> list[CompoundGeneInteraction]:
-    try:
-        return await chembl.get_compounds_for_gene(gene.gene_symbol, gene.gene_id)
-    except Exception as exc:
-        logger.warning("Compound fetch failed for %s: %s", gene.gene_symbol, exc)
-        return []
-
-
-async def _fetch_foods(compound_name: str) -> list[FoodCompoundMapping]:
-    """Fetch foods from FooDB and USDA concurrently and combine results.
-
-    FooDB covers bioactive phytochemicals (quercetin, resveratrol, etc.)
-    that are often absent from USDA.  USDA is authoritative for macronutrients
-    and common micronutrients.  Running both in parallel maximises coverage
-    without adding latency.
-    """
-    foodb_results, usda_results = await asyncio.gather(
-        _fetch_foods_foodb(compound_name),
-        _fetch_foods_usda(compound_name),
-    )
-
-    # Deduplicate by (food_name, source) so the same food from the same
-    # source never appears twice, while still keeping FooDB and USDA entries
-    # for the same real-world food (they carry different metadata).
-    seen: set[tuple[str, str]] = set()
-    combined: list[FoodCompoundMapping] = []
-    for mapping in foodb_results + usda_results:
-        key = (mapping.food_name.lower(), mapping.source)
-        if key not in seen:
-            seen.add(key)
-            combined.append(mapping)
-
-    if combined:
-        logger.debug(
-            "Foods for '%s': %d FooDB + %d USDA = %d combined",
-            compound_name,
-            len(foodb_results),
-            len(usda_results),
-            len(combined),
-        )
-    return combined
-
-
-async def _fetch_foods_foodb(compound_name: str) -> list[FoodCompoundMapping]:
-    logger.info("_fetch_foods_foodb called with compound: %s", compound_name)
-    try:
-        results = await foodb.search_foods_by_compound(compound_name)
-        logger.debug("FooDB returned %d result(s) for '%s'", len(results), compound_name)
-        return results
-    except Exception as exc:
-        logger.warning("FooDB food fetch failed for '%s': %s", compound_name, exc)
-        return []
-
-
-async def _fetch_foods_usda(compound_name: str) -> list[FoodCompoundMapping]:
-    logger.info("_fetch_foods_usda called with compound: %s", compound_name)
-    try:
-        results = await usda.search_foods_by_compound(compound_name)
-        logger.debug("USDA returned %d result(s) for '%s'", len(results), compound_name)
-        return results
-    except Exception as exc:
-        logger.warning("USDA food fetch failed for '%s': %s", compound_name, exc)
-        return []
-
-
 async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
     """Execute the full automation pipeline for a given disease."""
     import uuid
@@ -109,7 +42,7 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
         request.disease_id,
     )
 
-    # Step 1: Disease → Genes
+    # Step 1: Disease → Genes (Open Targets)
     genes = await disgenet.get_disease_gene_associations(
         disease_id=request.disease_id,
         min_score=request.min_gene_score,
@@ -120,17 +53,13 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
     if not genes:
         return _empty_response(run_id, request)
 
-    # Step 2: Genes → Pathways & Compounds (concurrent per gene)
-    pathway_tasks = [_fetch_pathways(g) for g in genes]
-    compound_tasks = [_fetch_compounds(g) for g in genes]
+    gene_symbols = [g.gene_symbol for g in genes]
 
-    pathway_results, compound_results = await asyncio.gather(
-        asyncio.gather(*pathway_tasks),
-        asyncio.gather(*compound_tasks),
+    # Step 2: Genes → Pathways & Compounds (concurrent Supabase queries)
+    all_pathways, all_compounds = await asyncio.gather(
+        _fetch_pathways(gene_symbols),
+        _fetch_compounds(gene_symbols),
     )
-
-    all_pathways: list[GenePathwayMapping] = [p for ps in pathway_results for p in ps]
-    all_compounds: list[CompoundGeneInteraction] = [c for cs in compound_results for c in cs]
 
     logger.info(
         "Found %d pathways, %d compounds", len(all_pathways), len(all_compounds)
@@ -139,23 +68,9 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
     if not all_compounds:
         return _empty_response(run_id, request, genes, all_pathways)
 
-    # Step 3: Compounds → Foods (concurrent)
-    # Guard: exclude any compound whose name is still a bare database ID
-    # (e.g. "CHEMBL360610").  These slip through when ChEMBL has no
-    # molecule_pref_name and would produce zero USDA results.
-    unique_compound_names = list({
-        c.compound_name
-        for c in all_compounds
-        if not c.compound_name.upper().startswith("CHEMBL")
-    })
-    if len(unique_compound_names) < len({c.compound_name for c in all_compounds}):
-        logger.warning(
-            "Dropped %d compound(s) with no human-readable name before USDA search",
-            len({c.compound_name for c in all_compounds}) - len(unique_compound_names),
-        )
-    food_tasks = [_fetch_foods(name) for name in unique_compound_names]
-    food_results: list[list[FoodCompoundMapping]] = await asyncio.gather(*food_tasks)
-    all_foods: list[FoodCompoundMapping] = [f for fs in food_results for f in fs]
+    # Step 3: Compounds → Foods (single batched Supabase query)
+    unique_compound_names = list({c.compound_name for c in all_compounds if c.compound_name})
+    all_foods = await _fetch_foods(unique_compound_names)
 
     logger.info("Found %d food mappings", len(all_foods))
 
@@ -176,37 +91,66 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
     )
 
 
+async def _fetch_pathways(gene_symbols: list[str]) -> list[GenePathwayMapping]:
+    try:
+        return await supabase_matcher.get_pathways_for_genes(gene_symbols)
+    except Exception as exc:
+        logger.warning("Supabase pathway fetch failed: %s", exc)
+        return []
+
+
+async def _fetch_compounds(gene_symbols: list[str]) -> list[CompoundGeneInteraction]:
+    try:
+        return await supabase_matcher.match_genes_to_compounds(gene_symbols)
+    except Exception as exc:
+        logger.warning("Supabase compound fetch failed: %s", exc)
+        return []
+
+
+async def _fetch_foods(compound_names: list[str]) -> list[FoodCompoundMapping]:
+    try:
+        return await supabase_matcher.get_foods_for_compounds(compound_names)
+    except Exception as exc:
+        logger.warning("Supabase food fetch failed: %s", exc)
+        return []
+
+
 def _build_scores(
     genes: list[DiseaseGeneAssociation],
     pathways: list[GenePathwayMapping],
     compounds: list[CompoundGeneInteraction],
     foods: list[FoodCompoundMapping],
 ) -> list[EvidenceScore]:
-    """Cross-join gene → pathway → compound → food and score each chain."""
-    gene_map: dict[str, DiseaseGeneAssociation] = {g.gene_id: g for g in genes}
+    """Cross-join gene → pathway → compound → food and score each chain.
+
+    Joins are keyed on gene_symbol (not gene_id) because Open Targets returns
+    Ensembl IDs as gene_id while Supabase records carry their own UUIDs there.
+    Gene symbol is a stable, shared key across both sources.
+    """
+    gene_map: dict[str, DiseaseGeneAssociation] = {g.gene_symbol: g for g in genes}
     pathway_by_gene: dict[str, list[GenePathwayMapping]] = {}
     compound_by_gene: dict[str, list[CompoundGeneInteraction]] = {}
     food_by_compound: dict[str, list[FoodCompoundMapping]] = {}
 
     for p in pathways:
-        pathway_by_gene.setdefault(p.gene_id, []).append(p)
+        pathway_by_gene.setdefault(p.gene_symbol, []).append(p)
     for c in compounds:
-        compound_by_gene.setdefault(c.gene_id, []).append(c)
+        compound_by_gene.setdefault(c.gene_symbol, []).append(c)
     for f in foods:
         food_by_compound.setdefault(f.compound_name.lower(), []).append(f)
 
     scores: list[EvidenceScore] = []
 
-    for gene_id, gene in gene_map.items():
-        gene_pathways = pathway_by_gene.get(gene_id, [])
-        gene_compounds = compound_by_gene.get(gene_id, [])
+    for gene_symbol, gene in gene_map.items():
+        gene_pathways = pathway_by_gene.get(gene_symbol, [])
+        gene_compounds = compound_by_gene.get(gene_symbol, [])
 
-        # Use a placeholder pathway if none found
+        # Use a placeholder pathway if none found in curated database
         if not gene_pathways:
             gene_pathways = [
                 GenePathwayMapping(
-                    gene_id=gene_id,
-                    gene_symbol=gene.gene_symbol,
+                    gene_id=gene.gene_id,
+                    gene_symbol=gene_symbol,
                     pathway_id="",
                     pathway_name="Unknown",
                 )
@@ -217,8 +161,8 @@ def _build_scores(
             if not compound_foods:
                 continue
 
-            for pathway in gene_pathways[:2]:  # limit to top 2 pathways per gene
-                for food in compound_foods[:3]:  # limit to top 3 foods per compound
+            for pathway in gene_pathways[:2]:   # top 2 pathways per gene
+                for food in compound_foods[:3]:  # top 3 foods per compound
                     chain = EvidenceChain(
                         disease_gene=gene,
                         pathway=pathway,

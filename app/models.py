@@ -95,7 +95,7 @@ class ReviewRecord(BaseModel):
 
 class AutomationRunRequest(BaseModel):
     disease_id: str
-    disease_name: str
+    disease_name: str = ""
     max_genes: int = Field(default=10, ge=1, le=50)
     min_gene_score: float = Field(default=0.3, ge=0.0, le=1.0)
 

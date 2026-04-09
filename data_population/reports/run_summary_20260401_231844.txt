@@ -1,0 +1,12 @@
+NatureWellness Population Run — 2026-04-01 23:18:44
+Mode: LIVE
+
+  PASS  Step 1: Fetch top 200 disease-associated genes from Open Targets  (5.0s)
+  PASS  Step 2: Populate pathways and gene_pathway_associations from KEGG  (5.0s)
+  PASS  Step 3: Populate 100+ natural food bioactives via PubChem validation  (3.6s)
+  PASS  Step 4: Populate gene–compound interactions (curated seed + CTD enrichment)  (3.6s)
+  FAIL  Step 5: Populate 300+ foods and 5 000+ food–compound associations  (35.9s)
+  PASS  Step 6: Run quality checks and generate HTML report  (9.9s)
+
+Passed: 5/6
+Wall time: 63.1s

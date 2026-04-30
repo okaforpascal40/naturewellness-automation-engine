@@ -3,9 +3,9 @@
 Flow:
   1. Open Targets         →  disease-associated genes
   2. KEGG (concurrent)    →  pathways for each gene
-  3. CTD batchQuery       →  phytochemical-gene interactions (filtered to dietary)
+  3. CTD snapshot         →  phytochemical-gene interactions (filtered to dietary)
   4. Supabase lookup      →  fruits/vegetables for each phytochemical
-  5. PubMed E-utilities   →  publication count + sample citations per phytochemical-gene pair
+  5. Offline grading      →  count unique PMIDs per pair, map to A/B/C grade
   6. Sort by grade + count, return top N recommendations
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ import logging
 import uuid
 from typing import Any
 
-from app.api import ctd_api, disgenet, kegg, pubmed_api
+from app.api import ctd_api, disgenet, kegg
 from app.database import get_fruits_for_phytochemicals
 from app.models import (
     AutomationRunRequest,
@@ -28,10 +28,18 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 # Caps to keep one pipeline run bounded.
-_MAX_PHYTOCHEMICALS = 30          # ranked by CTD publication_count before PubMed
+_MAX_PHYTOCHEMICALS = 30          # ranked by aggregated CTD publication_count
 _MAX_PATHWAYS_PER_GENE = 2
-_PUBMED_CONCURRENCY = 3           # NCBI: 3 req/s without API key, 10 with
+_MAX_PAIRS_PER_RUN = 20           # cap on (chemical, gene) pairs scored per run
 _DEFAULT_TOP_RESULTS = 20
+
+# Evidence-grade thresholds calibrated for CTD's curated PMID counts.
+# CTD counts are smaller than PubMed live search counts because CTD only
+# stores literature directly cited for a curated interaction.
+_GRADE_A_MIN = 10
+_GRADE_B_MIN = 3
+_GRADE_C_MIN = 1
+_SAMPLE_CITATIONS = 3             # PMIDs to surface per recommendation
 
 # Map letter grade to a sort weight (higher = better).
 _GRADE_RANK = {"A": 3, "B": 2, "C": 1, "None": 0}
@@ -95,23 +103,26 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
         if row["chemical_name"] in fruits_map and row["gene_symbol"] in gene_by_symbol
     ]
 
-    # ── Step 5: PubMed evidence per (phytochemical, gene) pair ────────────────
-    # Rank pairs by CTD publication_count and cap to pubmed_api.MAX_PAIRS_PER_RUN
-    # so total response time stays bounded even for high-coverage diseases.
-    pair_counts: dict[tuple[str, str], int] = {}
+    # ── Step 5: Offline evidence grading from CTD-stored PMIDs ────────────────
+    # Aggregate unique PMIDs per (chemical, gene) pair across all CTD interaction
+    # rows (CTD lists each interaction-action as its own row, often citing
+    # overlapping literature — set-union avoids double-counting).
+    pair_pmids: dict[tuple[str, str], set[str]] = {}
     for r in relevant_rows:
         key = (r["chemical_name"], r["gene_symbol"])
-        pair_counts[key] = pair_counts.get(key, 0) + int(r.get("publication_count", 0))
+        pair_pmids.setdefault(key, set()).update(r.get("pmids") or [])
 
-    ranked_pairs = sorted(pair_counts.items(), key=lambda kv: kv[1], reverse=True)
-    top_pair_set = {pair for pair, _ in ranked_pairs[: pubmed_api.MAX_PAIRS_PER_RUN]}
+    # Rank pairs by unique-PMID count, cap at _MAX_PAIRS_PER_RUN.
+    ranked_pairs = sorted(pair_pmids.items(), key=lambda kv: len(kv[1]), reverse=True)
+    top_pairs = ranked_pairs[:_MAX_PAIRS_PER_RUN]
+    top_pair_set = {pair for pair, _ in top_pairs}
 
     logger.info(
-        "Grading %d / %d unique (phytochemical, gene) pair(s) via PubMed (capped)",
+        "Grading %d / %d unique (phytochemical, gene) pair(s) offline from CTD PMIDs",
         len(top_pair_set),
-        len(pair_counts),
+        len(pair_pmids),
     )
-    grades = await _grade_pairs(sorted(top_pair_set))
+    grades = _grade_offline(top_pairs)
 
     # Drop CTD rows whose pair didn't make the cap — they wouldn't be graded.
     relevant_rows = [
@@ -178,24 +189,36 @@ async def _fetch_fruits(phytochemical_names: list[str]) -> dict[str, list[str]]:
         return {}
 
 
-async def _grade_pairs(
-    pairs: list[tuple[str, str]],
+def _grade_offline(
+    ranked_pairs: list[tuple[tuple[str, str], set[str]]],
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """Run pubmed_api.grade_evidence for each pair with bounded concurrency."""
-    semaphore = asyncio.Semaphore(_PUBMED_CONCURRENCY)
+    """Compute evidence grades from CTD-stored PMIDs — no network calls.
 
-    async def grade(pair: tuple[str, str]) -> tuple[tuple[str, str], dict[str, Any]]:
-        chem, gene = pair
-        async with semaphore:
-            try:
-                result = await pubmed_api.grade_evidence(chem, gene, sample_size=3)
-            except Exception as exc:
-                logger.warning("PubMed grading failed for (%s, %s): %s", chem, gene, exc)
-                result = {"publication_count": 0, "evidence_grade": "None", "sample_citations": []}
-        return pair, result
+    `ranked_pairs` is an iterable of ((chem, gene), {pmid, pmid, ...}) tuples.
+    Returns the same dict shape the live PubMed grader produced, so downstream
+    code (build_recommendations) is unchanged.
+    """
+    grades: dict[tuple[str, str], dict[str, Any]] = {}
+    for pair, pmids in ranked_pairs:
+        count = len(pmids)
+        if count >= _GRADE_A_MIN:
+            grade = "A"
+        elif count >= _GRADE_B_MIN:
+            grade = "B"
+        elif count >= _GRADE_C_MIN:
+            grade = "C"
+        else:
+            grade = "None"
 
-    results = await asyncio.gather(*(grade(p) for p in pairs))
-    return dict(results)
+        # Stable sample selection: take the lexicographically smallest PMIDs so
+        # repeat runs return the same citations for the same pair.
+        sample = [f"PMID {pmid}" for pmid in sorted(pmids)[:_SAMPLE_CITATIONS]]
+        grades[pair] = {
+            "publication_count": count,
+            "evidence_grade": grade,
+            "sample_citations": sample,
+        }
+    return grades
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────

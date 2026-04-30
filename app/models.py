@@ -100,6 +100,17 @@ class AutomationRunRequest(BaseModel):
     min_gene_score: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
+class FruitRecommendation(BaseModel):
+    fruit_vegetable: str
+    phytochemical: str
+    gene_target: str
+    interaction_type: str = ""
+    evidence_grade: str = "None"
+    publication_count: int = 0
+    sample_citations: list[str] = Field(default_factory=list)
+    pathway: str = ""
+
+
 class AutomationRunResponse(BaseModel):
     run_id: str
     disease_id: str
@@ -108,7 +119,8 @@ class AutomationRunResponse(BaseModel):
     pathways_found: int
     compounds_found: int
     foods_found: int
-    evidence_scores: list[EvidenceScore]
+    evidence_scores: list[EvidenceScore] = Field(default_factory=list)
+    recommendations: list[FruitRecommendation] = Field(default_factory=list)
     status: str
 
 

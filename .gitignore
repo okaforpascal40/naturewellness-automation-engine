@@ -208,6 +208,7 @@ __marimo__/
 
 # Project-specific
 .vscode/
+.claude/
 checkpoints/
 data_population/checkpoints/
 data_population/logs/

@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import automation, manual_review
+from app.routers import automation, camscan, manual_review
 
 logging.basicConfig(
     level=get_settings().log_level,
@@ -50,6 +50,7 @@ def create_app() -> FastAPI:
 
     app.include_router(automation.router, prefix="/api/v1")
     app.include_router(manual_review.router, prefix="/api/v1")
+    app.include_router(camscan.router, prefix="/api/v1")
 
     return app
 

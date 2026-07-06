@@ -27,6 +27,7 @@ _TABLE = "ctd_phytochemical_gene_interactions"
 
 # Cap to avoid sending an oversized .in_() filter to PostgREST.
 _MAX_GENES_PER_REQUEST = 100
+_MAX_CHEMICALS_PER_REQUEST = 100
 
 # --- Phytochemical whitelist ------------------------------------------------
 # Curated dietary bioactives commonly studied in food/nutrition research.
@@ -134,6 +135,84 @@ async def get_chemicals_for_genes(
     return results
 
 
+async def get_genes_for_chemicals(
+    chemical_names: list[str],
+) -> list[dict[str, Any]]:
+    """Reverse lookup — gene interactions for a set of phytochemicals.
+
+    Symmetric to :func:`get_chemicals_for_genes`; used by the CamScan reverse
+    pipeline (plant → phytochemicals → genes). Matching is case-insensitive:
+    CTD ChemicalName casing may differ from the phytochemical_sources table
+    (e.g. "Curcumin" vs "curcumin"), so misses from the exact ``.in_()`` filter
+    are retried per-name with ``.ilike()``.
+
+    Returns one record per (chemical, gene, interaction) row, in the same shape
+    as :func:`get_chemicals_for_genes`.
+    """
+    if not chemical_names:
+        return []
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for name in chemical_names:
+        s = (name or "").strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            deduped.append(s)
+
+    # Local import to avoid circular import at module load time.
+    from app.database import get_supabase
+
+    try:
+        client = await get_supabase()
+    except Exception as exc:
+        logger.error("CTD reverse lookup: Supabase client unavailable: %s", exc)
+        return []
+
+    columns = "chemical_name,gene_symbol,gene_id,interaction_actions,pubmed_ids,publication_count"
+    rows: list[dict[str, Any]] = []
+    matched_lower: set[str] = set()
+
+    for batch_start in range(0, len(deduped), _MAX_CHEMICALS_PER_REQUEST):
+        batch = deduped[batch_start : batch_start + _MAX_CHEMICALS_PER_REQUEST]
+        try:
+            resp = (
+                await client.table(_TABLE)
+                .select(columns)
+                .in_("chemical_name", batch)
+                .execute()
+            )
+        except Exception as exc:
+            logger.error("CTD reverse Supabase query failed: %s", exc)
+            continue
+        for r in resp.data or []:
+            rows.append(r)
+            matched_lower.add((r.get("chemical_name") or "").strip().lower())
+
+    # Case-insensitive fallback for any name the exact filter missed.
+    misses = [n for n in deduped if n.lower() not in matched_lower]
+    for name in misses:
+        try:
+            resp = (
+                await client.table(_TABLE)
+                .select(columns)
+                .ilike("chemical_name", name)
+                .execute()
+            )
+        except Exception as exc:
+            logger.warning("CTD reverse ilike lookup failed for %r: %s", name, exc)
+            continue
+        rows.extend(resp.data or [])
+
+    results = [_normalize_row(r) for r in rows if r]
+    logger.info(
+        "CTD reverse: %d gene interaction(s) found across %d phytochemical(s)",
+        len(results),
+        len(deduped),
+    )
+    return results
+
+
 def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     """Map a Supabase row to the live-API response shape."""
     actions = row.get("interaction_actions") or []
@@ -150,6 +229,7 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "chemical_name": (row.get("chemical_name") or "").strip(),
         "gene_symbol": (row.get("gene_symbol") or "").strip(),
+        "gene_id": (str(row.get("gene_id")).strip() if row.get("gene_id") else ""),
         "interaction_type": interaction_type,
         "publication_count": int(pub_count),
         "pmids": pmids,

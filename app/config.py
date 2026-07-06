@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     usda_api_key: str = ""
     foodb_api_url: str = "https://foodb.ca"
 
+    # NCBI E-utilities (PubMed) — lifts the rate limit when set
+    ncbi_api_key: str = ""
+
+    # Plant.id / Kindwise crop identification (CamScan)
+    plantid_api_key: str = ""
+    plantid_api_url: str = "https://crop.kindwise.com/api/v1/identification"
+
     # App
     app_env: str = "development"
     log_level: str = "INFO"

@@ -13,7 +13,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.config import get_settings
 
@@ -39,10 +39,31 @@ _SYSTEM = (
 
 
 class SummaryRequest(BaseModel):
+    """Both field spellings are accepted.
+
+    The shipped frontend posts `top_foods` / `top_phytochemicals` / `top_genes`;
+    the shorter `foods` / `phytochemicals` / `genes` are accepted as aliases so
+    either client works and neither has to be redeployed in lockstep.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
     disease_name: str = Field(min_length=1, max_length=200)
-    top_foods: list[str] = Field(default_factory=list, max_length=20)
-    top_phytochemicals: list[str] = Field(default_factory=list, max_length=20)
-    top_genes: list[str] = Field(default_factory=list, max_length=20)
+    top_foods: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("top_foods", "foods"),
+    )
+    top_phytochemicals: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("top_phytochemicals", "phytochemicals"),
+    )
+    top_genes: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("top_genes", "genes"),
+    )
     evidence_grade: str = Field(default="", max_length=40)
 
 

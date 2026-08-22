@@ -15,7 +15,7 @@ import logging
 import uuid
 from typing import Any
 
-from app.api import ctd_api, disgenet, kegg
+from app.api import chembl, ctd_api, disgenet, kegg
 from app.database import get_fruits_for_phytochemicals
 from app.models import (
     AutomationRunRequest,
@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 # Caps to keep one pipeline run bounded.
 _MAX_PHYTOCHEMICALS = 30          # ranked by aggregated CTD publication_count
+# How many ranked chemicals to test for a fruit/vegetable mapping before
+# settling on the top _MAX_PHYTOCHEMICALS. Since the CTD snapshot grew from ~80
+# to ~1,700 compounds, the highest-publication chemicals are often ones we have
+# no food source for; checking only the top 30 would let them crowd out the
+# compounds that can actually become a recommendation.
+_FRUIT_LOOKUP_CANDIDATES = 300
 _MAX_PATHWAYS_PER_GENE = 2
 _MAX_PAIRS_PER_RUN = 20           # cap on (chemical, gene) pairs scored per run
 _DEFAULT_TOP_RESULTS = 20
@@ -55,13 +61,17 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
         request.disease_id,
     )
 
-    # ── Step 1: Disease → Genes (Open Targets) ────────────────────────────────
+    # ── Step 1: Disease → Genes (Open Targets, supplemented by DisGeNET) ──────
     genes = await disgenet.get_disease_gene_associations(
         disease_id=request.disease_id,
         min_score=request.min_gene_score,
         limit=request.max_genes,
     )
-    logger.info("Found %d genes for disease %s", len(genes), request.disease_id)
+    logger.info(
+        "Open Targets returned %d gene(s) for disease %s", len(genes), request.disease_id
+    )
+
+    genes = await _merge_additional_genes(genes, request)
     if not genes:
         return _empty_response(run_id, request)
 
@@ -79,21 +89,36 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
         len(ctd_rows),
     )
 
+    # ── Step 3b: ChEMBL fallback when the CTD snapshot has nothing ────────────
     if not ctd_rows:
-        return _empty_response(run_id, request, genes=genes, pathways=pathways)
+        logger.info("CTD returned no rows — falling back to ChEMBL for %d gene(s)", len(gene_symbols))
+        ctd_rows = await _fetch_chembl_fallback(gene_symbols)
+        if not ctd_rows:
+            return _empty_response(run_id, request, genes=genes, pathways=pathways)
 
     # ── Step 4: Phytochemicals → Fruits/Vegetables (Supabase) ─────────────────
     unique_phytochemicals = list({row["chemical_name"] for row in ctd_rows})
 
-    # Rank phytochemicals by CTD pub_count and cap before the heavy steps.
-    ranked_chems = _rank_phytochemicals(ctd_rows)[:_MAX_PHYTOCHEMICALS]
-    capped_names = [name for name, _ in ranked_chems]
+    # Rank by CTD pub_count, then keep the best _MAX_PHYTOCHEMICALS that we can
+    # actually name a food source for. Ranking and capping in one step would
+    # spend the whole budget on well-studied compounds with no food mapping.
+    ranked_chems = _rank_phytochemicals(ctd_rows)
+    candidate_names = [name for name, _ in ranked_chems[:_FRUIT_LOOKUP_CANDIDATES]]
 
-    fruits_map = await _fetch_fruits(capped_names)
+    candidate_fruits = await _fetch_fruits(candidate_names)
+    fruits_map = {
+        name: candidate_fruits[name]
+        for name in candidate_names
+        if candidate_fruits.get(name)
+    }
+    if len(fruits_map) > _MAX_PHYTOCHEMICALS:
+        kept = list(fruits_map)[:_MAX_PHYTOCHEMICALS]
+        fruits_map = {name: fruits_map[name] for name in kept}
     logger.info(
-        "Phytochemicals with fruit mappings: %d / %d",
+        "Phytochemicals with fruit mappings: %d kept from %d candidate(s) (%d ranked)",
         len(fruits_map),
-        len(capped_names),
+        len(candidate_names),
+        len(ranked_chems),
     )
 
     # Drop any CTD rows whose chemical didn't make the cap or has no fruit mapping.
@@ -175,10 +200,77 @@ async def _fetch_pathways(
 
 async def _fetch_phytochemicals(gene_symbols: list[str]) -> list[dict[str, Any]]:
     try:
-        return await ctd_api.get_chemicals_for_genes(gene_symbols)
+        rows = await ctd_api.get_chemicals_for_genes(gene_symbols)
     except Exception as exc:
         logger.warning("CTD fetch failed: %s", exc)
         return []
+    for row in rows:
+        row.setdefault("source", "CTD")
+    return rows
+
+
+async def _fetch_chembl_fallback(gene_symbols: list[str]) -> list[dict[str, Any]]:
+    """Natural-product compounds from ChEMBL, in the CTD row shape."""
+    try:
+        rows = await chembl.get_natural_compounds_for_genes(gene_symbols)
+    except Exception as exc:  # noqa: BLE001 - the fallback must not break the run
+        logger.warning("ChEMBL fallback failed: %s", exc)
+        return []
+    logger.info("ChEMBL fallback produced %d row(s)", len(rows))
+    return rows
+
+
+async def _merge_additional_genes(
+    genes: list[DiseaseGeneAssociation],
+    request: AutomationRunRequest,
+) -> list[DiseaseGeneAssociation]:
+    """Append DisGeNET genes that Open Targets did not already return.
+
+    Supplementary genes carry score 0.0 and source "disgenet" so downstream
+    ranking still prefers Open Targets' scored associations.
+    """
+    disease_name = (request.disease_name or "").strip()
+    if not disease_name:
+        return genes
+
+    try:
+        extra_symbols = await disgenet.get_additional_genes(disease_name)
+    except Exception as exc:  # noqa: BLE001 - a supplement must never break the run
+        logger.warning("DisGeNET merge failed: %s", exc)
+        return genes
+
+    if not extra_symbols:
+        return genes
+
+    known = {g.gene_symbol.strip().upper() for g in genes}
+    merged = list(genes)
+    added = 0
+    for symbol in extra_symbols:
+        if symbol in known:
+            continue
+        known.add(symbol)
+        try:
+            merged.append(
+                DiseaseGeneAssociation(
+                    disease_id=request.disease_id,
+                    disease_name=disease_name,
+                    gene_id="",
+                    gene_symbol=symbol,
+                    score=0.0,
+                    source="disgenet",
+                )
+            )
+            added += 1
+        except Exception:
+            logger.warning("Skipping malformed DisGeNET gene symbol: %r", symbol)
+
+    logger.info(
+        "Genes after DisGeNET merge: %d (%d from Open Targets, %d added)",
+        len(merged),
+        len(genes),
+        added,
+    )
+    return merged
 
 
 async def _fetch_fruits(phytochemical_names: list[str]) -> dict[str, list[str]]:
@@ -287,6 +379,7 @@ def _build_recommendations(
                     publication_count=pub_count,
                     sample_citations=citations,
                     pathway=pathway_name,
+                    source=row.get("source", "CTD"),
                 )
             )
     return out

@@ -109,6 +109,8 @@ class FruitRecommendation(BaseModel):
     publication_count: int = 0
     sample_citations: list[str] = Field(default_factory=list)
     pathway: str = ""
+    # Which upstream database this interaction came from: "CTD" or "ChEMBL".
+    source: str = "CTD"
 
 
 class AutomationRunResponse(BaseModel):

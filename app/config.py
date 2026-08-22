@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     # NCBI E-utilities (PubMed) — lifts the rate limit when set
     ncbi_api_key: str = ""
 
+    # DisGeNET — supplements Open Targets with extra disease-gene associations.
+    # The old open endpoint at www.disgenet.org/api was retired; the current
+    # API requires a key from https://disgenet.com/. Unset = feature disabled.
+    disgenet_api_key: str = ""
+    disgenet_api_url: str = "https://api.disgenet.com/api/v1"
+
     # Plant.id / Kindwise crop identification (CamScan)
     plantid_api_key: str = ""
     plantid_api_url: str = "https://crop.kindwise.com/api/v1/identification"

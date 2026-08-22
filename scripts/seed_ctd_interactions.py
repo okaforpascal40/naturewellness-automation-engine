@@ -125,8 +125,27 @@ def main() -> int:
     return 0
 
 
-def _flush(client, batch: list[dict[str, object]]) -> None:
-    client.table(TABLE).insert(batch).execute()
+def _flush(client, batch: list[dict[str, object]], attempts: int = 4) -> None:
+    """Insert one batch, retrying transient failures.
+
+    The run clears the table before inserting, so an unretried blip partway
+    through ~325 batches would leave the table half-populated with the previous
+    data already gone. Backs off 1s, 2s, 4s and re-raises if it still fails.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            client.table(TABLE).insert(batch).execute()
+            return
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            delay = 2 ** (attempt - 1)
+            print(
+                f"  WARN: batch insert failed ({exc.__class__.__name__}), "
+                f"retry {attempt}/{attempts - 1} in {delay}s",
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 if __name__ == "__main__":

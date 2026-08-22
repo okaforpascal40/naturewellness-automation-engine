@@ -4,7 +4,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # extra="ignore": deployment environments inject variables this model does
+    # not declare (Railway/Vercel internals, an operator's SERVICE_ROLE_KEY).
+    # The default "forbid" turns any one of them into a validation error that
+    # takes down every caller of get_settings() — Supabase, ChEMBL, the lot —
+    # and surfaces as an empty result rather than an obvious config failure.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # Supabase
     supabase_url: str = ""

@@ -55,6 +55,46 @@ class HealthBenefitsRequest(BaseModel):
     scientific_name: str = ""
 
 
+class PlantConditionTreatment(BaseModel):
+    biological: str = ""
+    chemical: str = ""
+    prevention: str = ""
+
+
+class PlantCondition(BaseModel):
+    name: str
+    probability: float = 0.0
+    # Defaults to harmful: an unlabelled condition should be shown as a caution
+    # rather than quietly presented as benign.
+    is_harmful: bool = True
+    description: str = ""
+    treatment: PlantConditionTreatment = Field(default_factory=PlantConditionTreatment)
+    url: str = ""
+
+
+class PlantIdentificationResponse(BaseModel):
+    """Identification plus, where the provider supplies it, a health assessment.
+
+    Every health field has a default: the assessment depends on the configured
+    provider supporting it, and its absence must never fail the identification.
+    `health_assessment_available` is what the UI should branch on — not the
+    emptiness of `plant_conditions`, since a healthy plant legitimately has none.
+    """
+
+    plant_name: str = ""
+    scientific_name: str = ""
+    confidence: float = 0.0
+    is_plant: bool = False
+    plant_image_url: str | None = None
+    common_names: list[str] = Field(default_factory=list)
+    low_confidence: bool = False
+
+    is_healthy: bool = True
+    health_probability: float = 1.0
+    plant_conditions: list[PlantCondition] = Field(default_factory=list)
+    health_assessment_available: bool = False
+
+
 class HealthAssociation(BaseModel):
     gene: str
     pathway: str = ""
@@ -79,7 +119,11 @@ class HealthBenefitsResponse(BaseModel):
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
-@router.post("/identify", summary="Identify a plant from an image")
+@router.post(
+    "/identify",
+    response_model=PlantIdentificationResponse,
+    summary="Identify a plant from an image and assess its health",
+)
 async def identify(request: IdentifyRequest) -> dict[str, Any]:
     """Identify a plant from a base64 image via the Plant.id API."""
     settings = get_settings()

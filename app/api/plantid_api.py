@@ -22,6 +22,15 @@ _DEFAULT_URL = "https://crop.kindwise.com/api/v1/identification"
 # flag it as low-confidence so the UI can warn the user.
 _LOW_CONFIDENCE_THRESHOLD = 0.2
 
+# Health-assessment tuning.
+_MAX_CONDITIONS = 5
+_MIN_CONDITION_PROBABILITY = 0.1   # below 10% the suggestion is noise
+_HEALTH_DETAILS = ["description", "treatment", "url", "common_names"]
+
+# Status codes that mean "the request shape was wrong", as opposed to auth or
+# server faults. Only these trigger the identification-only retry.
+_BAD_REQUEST_CODES = {400, 404, 422}
+
 
 async def identify_plant(
     image_base64: str,
@@ -57,11 +66,21 @@ async def identify_plant(
         _, _, image_base64 = image_base64.partition(",")
 
     headers = {"Api-Key": api_key, "Content-Type": "application/json"}
-    body = {"images": [image_base64], "similar_images": True}
+    base_body: dict[str, Any] = {"images": [image_base64], "similar_images": True}
+    # `health` is Plant.id v3 syntax. The configured endpoint defaults to
+    # crop.kindwise.com, whose parameter set differs, so a rejection here must
+    # not cost us the identification — see the retry below.
+    health_body = {**base_body, "health": "all", "details": _HEALTH_DETAILS}
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(api_url, json=body, headers=headers)
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(api_url, json=health_body, headers=headers)
+            if response.status_code in _BAD_REQUEST_CODES:
+                logger.info(
+                    "Plant.id: health assessment rejected (%s); retrying identification only",
+                    response.status_code,
+                )
+                response = await client.post(api_url, json=base_body, headers=headers)
             response.raise_for_status()
             payload: dict[str, Any] = response.json()
     except httpx.HTTPStatusError as exc:
@@ -133,7 +152,100 @@ def _normalize_response(payload: dict[str, Any]) -> dict[str, Any]:
         )
         normalized["low_confidence"] = True
 
+    normalized.update(_normalize_health(result))
     return normalized
+
+
+def _normalize_health(result: dict[str, Any]) -> dict[str, Any]:
+    """Extract the health assessment, if the response carries one.
+
+    Written against two response shapes because the endpoint is configurable:
+    Plant.id v3 nests disease suggestions under `result.disease`, while
+    crop.kindwise uses `result.disease` or `result.crop` depending on product.
+    Anything missing degrades to "no assessment available" rather than raising —
+    identification is the feature that must not break.
+    """
+    conditions: list[dict[str, Any]] = []
+    for key in ("disease", "health_assessment", "crop"):
+        section = result.get(key)
+        if not isinstance(section, dict):
+            continue
+        suggestions = section.get("suggestions") or section.get("diseases")
+        if isinstance(suggestions, list) and suggestions:
+            conditions = _parse_conditions(suggestions)
+            if conditions:
+                break
+
+    is_healthy_info = result.get("is_healthy")
+    if isinstance(is_healthy_info, dict):
+        is_healthy = bool(is_healthy_info.get("binary", True))
+        health_probability = _safe_float(is_healthy_info.get("probability"), 1.0)
+    elif isinstance(is_healthy_info, bool):
+        is_healthy = is_healthy_info
+        health_probability = 1.0
+    else:
+        # No explicit flag: infer from whether anything harmful was suggested.
+        is_healthy = not any(c["is_harmful"] for c in conditions)
+        health_probability = 1.0 if is_healthy else 0.0
+
+    return {
+        "is_healthy": is_healthy,
+        "health_probability": round(health_probability, 4),
+        "plant_conditions": conditions,
+        "health_assessment_available": bool(conditions) or isinstance(is_healthy_info, dict),
+    }
+
+
+def _parse_conditions(suggestions: list[Any]) -> list[dict[str, Any]]:
+    """Map raw disease suggestions to the CamScan condition shape."""
+    out: list[dict[str, Any]] = []
+    for suggestion in suggestions:
+        if not isinstance(suggestion, dict):
+            continue
+        probability = _safe_float(suggestion.get("probability"), 0.0)
+        if probability <= _MIN_CONDITION_PROBABILITY:
+            continue
+
+        details = suggestion.get("details") if isinstance(suggestion.get("details"), dict) else {}
+        treatment_raw = details.get("treatment")
+        treatment = treatment_raw if isinstance(treatment_raw, dict) else {}
+
+        name = (suggestion.get("name") or "").strip()
+        if not name:
+            continue
+
+        out.append(
+            {
+                "name": name,
+                "probability": round(probability, 4),
+                # Absent means unknown; assume harmful so the UI errs toward caution.
+                "is_harmful": bool(suggestion.get("is_harmful", True)),
+                "description": str(details.get("description") or "").strip(),
+                "treatment": {
+                    "biological": _join_treatment(treatment.get("biological")),
+                    "chemical": _join_treatment(treatment.get("chemical")),
+                    "prevention": _join_treatment(treatment.get("prevention")),
+                },
+                "url": str(details.get("url") or "").strip(),
+            }
+        )
+        if len(out) >= _MAX_CONDITIONS:
+            break
+    return out
+
+
+def _join_treatment(value: Any) -> str:
+    """Treatment advice arrives as either a string or a list of steps."""
+    if isinstance(value, list):
+        return " ".join(str(v).strip() for v in value if str(v).strip())
+    return str(value or "").strip()
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _first_similar_image_url(similar_images: Any) -> str | None:

@@ -125,6 +125,13 @@ class AutomationRunResponse(BaseModel):
     recommendations: list[FruitRecommendation] = Field(default_factory=list)
     status: str
 
+    # Provenance for runs that did not come straight from Open Targets. The UI
+    # must show these: a reader has to know when they are looking at a weaker
+    # class of evidence than the usual gene-pathway chain.
+    data_source: str = "open_targets"
+    evidence_note: str = ""
+    disclaimer: str = ""
+
 
 class ReviewUpdateRequest(BaseModel):
     status: ManualReviewStatus

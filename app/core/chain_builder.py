@@ -13,9 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
-from app.api import chembl, ctd_api, disgenet, kegg
+from app.api import chembl, ctd_api, disease_synonyms, disgenet, kegg, pubmed_fallback
+from app.data import infectious_disease_compounds
 from app.database import get_fruits_for_phytochemicals
 from app.models import (
     AutomationRunRequest,
@@ -71,9 +73,18 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
         "Open Targets returned %d gene(s) for disease %s", len(genes), request.disease_id
     )
 
+    # ── Step 1b: Recovery ladder for conditions Open Targets scores poorly ────
+    # Pathogen-caused diseases often have associations that all sit below the
+    # default 0.3 floor (typhoid fever: 284 targets, best score 0.05), so an
+    # unmodified run reports "0 genes" for a disease Open Targets does cover.
+    provenance = _Provenance()
+    if not genes:
+        genes, provenance = await _recover_genes(request)
+
     genes = await _merge_additional_genes(genes, request)
     if not genes:
-        return _empty_response(run_id, request)
+        # Nothing gene-shaped anywhere — try the literature directly.
+        return await _literature_only_response(run_id, request)
 
     gene_symbols = [g.gene_symbol for g in genes]
     gene_by_symbol: dict[str, DiseaseGeneAssociation] = {g.gene_symbol: g for g in genes}
@@ -176,6 +187,9 @@ async def run_pipeline(request: AutomationRunRequest) -> AutomationRunResponse:
         evidence_scores=[],
         recommendations=recommendations,
         status="completed",
+        data_source=provenance.data_source,
+        evidence_note=provenance.evidence_note,
+        disclaimer=provenance.disclaimer,
     )
 
 
@@ -207,6 +221,155 @@ async def _fetch_phytochemicals(gene_symbols: list[str]) -> list[dict[str, Any]]
     for row in rows:
         row.setdefault("source", "CTD")
     return rows
+
+
+@dataclass
+class _Provenance:
+    """How a run's genes were obtained, for disclosure in the response."""
+
+    data_source: str = "open_targets"
+    evidence_note: str = ""
+    disclaimer: str = ""
+
+
+async def _recover_genes(
+    request: AutomationRunRequest,
+) -> tuple[list[DiseaseGeneAssociation], _Provenance]:
+    """Ladder of increasingly indirect ways to obtain genes for a disease.
+
+    Ordered by how far each step strays from what the caller asked about:
+      1. same disease, lower score floor  — still its own data
+      2. a synonym's disease entity       — a related condition, disclosed
+      3. curated host-response genes      — literature for the infection type
+    """
+    name = request.disease_name or ""
+
+    # 1. Same disease, weaker floor.
+    genes, floor = await disease_synonyms.retry_with_lower_threshold(
+        request.disease_id, request.min_gene_score, request.max_genes
+    )
+    if genes:
+        return genes, _Provenance(
+            data_source="open_targets_low_confidence",
+            evidence_note=(
+                f"Open Targets has no associations for this condition above the usual "
+                f"confidence threshold, so results use its weaker associations "
+                f"(score ≥ {floor:g})."
+            ),
+        )
+
+    # 2. A related condition.
+    genes, label = await disease_synonyms.try_disease_synonyms(
+        name, request.min_gene_score, request.max_genes, exclude_id=request.disease_id
+    )
+    if genes:
+        return genes, _Provenance(
+            data_source="open_targets_synonym",
+            evidence_note=f"Results based on related condition: {label}",
+        )
+
+    # 3. Curated host-response genes for this infection type.
+    curated = infectious_disease_compounds.lookup(name)
+    if curated:
+        key, entry = curated
+        associations: list[DiseaseGeneAssociation] = []
+        for symbol in entry["genes"]:
+            try:
+                associations.append(
+                    DiseaseGeneAssociation(
+                        disease_id=request.disease_id,
+                        disease_name=name,
+                        gene_id="",
+                        gene_symbol=symbol,
+                        score=0.0,
+                        source="curated_literature",
+                    )
+                )
+            except Exception:
+                logger.warning("Skipping malformed curated gene symbol: %r", symbol)
+        if associations:
+            logger.info(
+                "Using curated host-response genes for %r (matched %r): %s",
+                name,
+                key,
+                [a.gene_symbol for a in associations],
+            )
+            meta = infectious_disease_compounds.response_metadata(entry)
+            return associations, _Provenance(
+                data_source=meta["data_source"],
+                evidence_note=meta["evidence_note"],
+                disclaimer=meta["disclaimer"],
+            )
+
+    return [], _Provenance()
+
+
+async def _literature_only_response(
+    run_id: str,
+    request: AutomationRunRequest,
+) -> AutomationRunResponse:
+    """Last resort: compounds studied against this disease in PubMed.
+
+    No gene chain is claimed. Every compound here is backed by a real search
+    hit and carries its PMIDs, so the reader can check it.
+    """
+    name = request.disease_name or ""
+    rows = await _fetch_pubmed_fallback(name)
+    if not rows:
+        return _empty_response(run_id, request)
+
+    ranked = _rank_phytochemicals(rows)
+    candidates = [n for n, _ in ranked[:_FRUIT_LOOKUP_CANDIDATES]]
+    found = await _fetch_fruits(candidates)
+    fruits_map = {n: found[n] for n in candidates if found.get(n)}
+    if not fruits_map:
+        return _empty_response(run_id, request)
+
+    pair_pmids: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        if row["chemical_name"] not in fruits_map:
+            continue
+        key = (row["chemical_name"], row["gene_symbol"])
+        pair_pmids.setdefault(key, set()).update(row.get("pmids") or [])
+
+    grades = _grade_offline(sorted(pair_pmids.items(), key=lambda kv: len(kv[1]), reverse=True))
+    recommendations = _build_recommendations(
+        ctd_rows=[r for r in rows if r["chemical_name"] in fruits_map],
+        fruits_map=fruits_map,
+        grades=grades,
+        pathway_by_gene={},
+    )
+    recommendations = _sort_and_trim(recommendations, top_n=_DEFAULT_TOP_RESULTS)
+
+    disclaimer = infectious_disease_compounds.TREATMENT_DISCLAIMER
+    return AutomationRunResponse(
+        run_id=run_id,
+        disease_id=request.disease_id,
+        disease_name=request.disease_name,
+        genes_found=0,
+        pathways_found=0,
+        compounds_found=len({r["chemical_name"] for r in rows}),
+        foods_found=len({r.fruit_vegetable for r in recommendations}),
+        evidence_scores=[],
+        recommendations=recommendations,
+        status="completed_literature_only",
+        data_source="pubmed_literature",
+        evidence_note=(
+            "No gene-level data was available for this condition, so these "
+            "compounds come from published studies pairing them with it. A "
+            "published study means the pairing has been investigated, not that "
+            "it is effective."
+        ),
+        disclaimer=disclaimer,
+    )
+
+
+async def _fetch_pubmed_fallback(disease_name: str) -> list[dict[str, Any]]:
+    try:
+        return await pubmed_fallback.get_phytochemicals_for_disease(disease_name)
+    except Exception as exc:  # noqa: BLE001 - the fallback must not break the run
+        logger.warning("PubMed fallback failed for %r: %s", disease_name, exc)
+        return []
 
 
 async def _fetch_chembl_fallback(gene_symbols: list[str]) -> list[dict[str, Any]]:

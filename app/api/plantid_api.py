@@ -32,6 +32,53 @@ _HEALTH_DETAILS = ["description", "treatment", "url", "common_names"]
 _BAD_REQUEST_CODES = {400, 404, 422}
 
 
+def _clean_key(api_key: str) -> str:
+    """Strip whitespace and any wrapping quotes from a configured key."""
+    cleaned = (api_key or "").strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
+def _host_of(api_url: str) -> str:
+    """Host portion of the configured endpoint, for error messages."""
+    without_scheme = (api_url or "").split("://", 1)[-1]
+    return without_scheme.split("/", 1)[0] or "the configured endpoint"
+
+
+def _describe_http_error(status_code: int | None, body: str, api_url: str) -> str:
+    """Turn a provider error into something that names the actual fix.
+
+    A bare "returned an error (401)" is the least useful thing we can say: the
+    provider distinguishes a missing key ("No api key provided") from a
+    rejected one ("The specified api key not found"), and those have different
+    fixes. Kindwise issues a separate key per product — plant.id, crop.health,
+    insect.id — so a key that works on one host is rejected on another.
+    """
+    host = _host_of(api_url)
+    lowered = (body or "").lower()
+
+    if status_code == 401:
+        if "no api key" in lowered:
+            return (
+                "Plant identification rejected the request because no API key was "
+                f"sent. Set PLANTID_API_KEY to a key issued for {host}."
+            )
+        return (
+            f"Plant identification rejected the API key for {host}. Kindwise issues "
+            "a separate key per product, so a plant.id key will not work on "
+            "crop.kindwise.com (or vice versa) — check that PLANTID_API_KEY was "
+            f"issued for {host}, and that it is active and has credit remaining."
+        )
+    if status_code == 402:
+        return (
+            f"The plant identification account for {host} has no credits remaining."
+        )
+    if status_code == 429:
+        return "Plant identification is rate limited right now. Please try again shortly."
+    return f"Plant identification service returned an error ({status_code or 'unknown'})."
+
+
 async def identify_plant(
     image_base64: str,
     api_key: str,
@@ -55,8 +102,15 @@ async def identify_plant(
         - confidence < 0.2          → result with "low_confidence": True
         - API / network errors      → raises RuntimeError with a clear message
     """
+    # Deployment UIs commonly store a pasted value with surrounding quotes or a
+    # trailing newline. Sent verbatim those produce a 401 that looks exactly
+    # like a wrong key, so normalise before deciding the key is missing.
+    api_key = _clean_key(api_key)
     if not api_key:
-        raise RuntimeError("PLANTID_API_KEY is not configured.")
+        raise RuntimeError(
+            "PLANTID_API_KEY is not configured. Set it to a key issued for "
+            f"{_host_of(api_url)} in the deployment environment."
+        )
     if not image_base64:
         raise RuntimeError("No image provided for plant identification.")
 
@@ -84,16 +138,10 @@ async def identify_plant(
             response.raise_for_status()
             payload: dict[str, Any] = response.json()
     except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
         detail = exc.response.text[:300] if exc.response is not None else ""
-        logger.error(
-            "Plant.id API error [%s]: %s",
-            exc.response.status_code if exc.response is not None else "?",
-            detail,
-        )
-        raise RuntimeError(
-            f"Plant identification service returned an error "
-            f"({exc.response.status_code if exc.response is not None else 'unknown'})."
-        ) from exc
+        logger.error("Plant.id API error [%s] at %s: %s", status_code or "?", api_url, detail)
+        raise RuntimeError(_describe_http_error(status_code, detail, api_url)) from exc
     except httpx.RequestError as exc:
         logger.error("Plant.id API request failed: %s", exc)
         raise RuntimeError(

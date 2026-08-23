@@ -168,3 +168,51 @@ class TestIdentificationStillWorks:
         normalized = _normalize_response({"result": {"is_plant": {"binary": False}}})
 
         assert normalized == {"is_plant": False}
+
+
+class TestCredentialErrors:
+    """The 401 path — where a bare status code cost real debugging time."""
+
+    def test_key_is_stripped_of_whitespace_and_quotes(self) -> None:
+        from app.api.plantid_api import _clean_key
+
+        # Deployment UIs store pasted values with quotes or a trailing newline;
+        # sent verbatim these look identical to a wrong key.
+        assert _clean_key('  abc123  ') == "abc123"
+        assert _clean_key('"abc123"') == "abc123"
+        assert _clean_key("'abc123'") == "abc123"
+        assert _clean_key("abc123\n") == "abc123"
+        assert _clean_key("") == ""
+        assert _clean_key("   ") == ""
+        assert _clean_key('"   "') == ""
+
+    def test_missing_and_rejected_keys_get_different_messages(self) -> None:
+        from app.api.plantid_api import _describe_http_error
+
+        url = "https://crop.kindwise.com/api/v1/identification"
+        missing = _describe_http_error(401, "No api key provided.", url)
+        rejected = _describe_http_error(401, "The specified api key not found.", url)
+
+        assert missing != rejected
+        assert "no API key was sent" in missing
+        # The rejected case must name the actual likely cause.
+        assert "separate key per product" in rejected
+        assert "crop.kindwise.com" in rejected
+
+    def test_error_message_names_the_configured_host(self) -> None:
+        from app.api.plantid_api import _describe_http_error, _host_of
+
+        assert _host_of("https://plant.id/api/v3/identification") == "plant.id"
+        message = _describe_http_error(
+            401, "The specified api key not found.", "https://plant.id/api/v3/identification"
+        )
+        assert "plant.id" in message
+
+    def test_payment_and_rate_limit_are_distinguished(self) -> None:
+        from app.api.plantid_api import _describe_http_error
+
+        url = "https://crop.kindwise.com/api/v1/identification"
+        assert "credits" in _describe_http_error(402, "", url)
+        assert "rate limited" in _describe_http_error(429, "", url)
+        # Anything unrecognised still reports its status code.
+        assert "500" in _describe_http_error(500, "", url)

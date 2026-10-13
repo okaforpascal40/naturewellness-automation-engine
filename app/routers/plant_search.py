@@ -111,19 +111,23 @@ async def search_plant(request: PlantSearchRequest) -> PlantSearchResponse:
 @router.get(
     "/suggestions",
     response_model=list[str],
-    summary="Plant names matching a partial query",
+    summary="Plant names matching a partial query; every plant when the query is empty",
 )
 async def plant_suggestions(q: str = Query("")) -> list[str]:
     query = q.strip().lower()
     # No Query(max_length): the contract is always a 200 array, so pasted text
-    # longer than any plant name simply matches nothing.
-    if not _MIN_SUGGESTION_QUERY <= len(query) <= _MAX_NAME_LENGTH:
+    # longer than any plant name simply matches nothing. An empty query browses
+    # the whole catalogue; a lone character is too broad to be useful.
+    if query and not _MIN_SUGGESTION_QUERY <= len(query) <= _MAX_NAME_LENGTH:
         return []
     try:
         rows = await plant_lookup.cached_phytochemical_sources()
     except Exception as exc:  # noqa: BLE001 - autocomplete must not error the UI
         logger.warning("Plant suggestions unavailable: %s", exc)
         return []
+
+    if not query:
+        return plant_lookup.plant_names(rows)
 
     names = [n for n in plant_lookup.plant_names(rows) if query in n.lower()]
     # Prefix matches first; plant_names is already alphabetical within each group.

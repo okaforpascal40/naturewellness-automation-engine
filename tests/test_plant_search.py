@@ -376,8 +376,25 @@ def test_suggestions_include_substring_matches_after_prefix(client: TestClient) 
     assert client.get(SUGGEST_URL, params={"q": "app"}).json() == ["Apple", "Custard apple"]
 
 
-@pytest.mark.parametrize("q", ["", "t", " t "])
-def test_short_query_returns_empty(client: TestClient, q: str) -> None:
+@pytest.mark.parametrize("q", ["", "  "])
+def test_empty_query_lists_every_plant_uncapped(
+    client: TestClient, supabase: _FakeSupabase, q: str
+) -> None:
+    supabase.rows = [
+        {"phytochemical_name": "X", "fruit_vegetables": [f"Berry {i:02d}" for i in range(25)]},
+        {"phytochemical_name": "Y", "fruit_vegetables": ["apple", "Apple", "Zobo"]},
+    ]
+
+    resp = client.get(SUGGEST_URL, params={"q": q})
+
+    assert resp.status_code == 200
+    names = resp.json()
+    assert len(names) == 27  # 25 berries + one Apple (case-deduplicated) + Zobo
+    assert names == sorted(names, key=str.lower)
+
+
+@pytest.mark.parametrize("q", ["t", " t "])
+def test_single_character_query_returns_empty(client: TestClient, q: str) -> None:
     resp = client.get(SUGGEST_URL, params={"q": q})
 
     assert resp.status_code == 200

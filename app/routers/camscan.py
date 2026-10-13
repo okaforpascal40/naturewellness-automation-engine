@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
@@ -24,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from app.api import ctd_api, kegg, plantid_api
 from app.config import get_settings
+from app.core import plant_lookup
 from app.database import get_supabase
 from app.models import GenePathwayMapping
 
@@ -34,12 +34,9 @@ router = APIRouter(prefix="/camscan", tags=["camscan"])
 # ── Tuning ────────────────────────────────────────────────────────────────────
 _TOP_GENES = 10
 _SAMPLE_CITATIONS = 3
-# Offline evidence-grade thresholds — mirror app/core/chain_builder.py, which
-# grades CTD-curated PMID counts (smaller than live PubMed search counts).
-_GRADE_A_MIN = 10
-_GRADE_B_MIN = 3
-_GRADE_C_MIN = 1
-_GRADE_RANK = {"A": 3, "B": 2, "C": 1, "None": 0}
+# Offline evidence grading (thresholds shared with chain_builder) lives in
+# app/core/plant_lookup.py.
+_GRADE_RANK = plant_lookup.GRADE_RANK
 
 _POTENTIAL_BENEFIT = "Evidence-Based Biological Association"
 _RECOMMENDATION_SOURCE = "academic_literature"
@@ -267,48 +264,13 @@ async def _build_health_benefits(
 
 
 # ── Stage helpers ─────────────────────────────────────────────────────────────
-def _tokens(text: str) -> set[str]:
-    return set(re.findall(r"[a-z]+", text.lower()))
-
-
 async def _find_phytochemicals_for_plant(plant_name: str) -> list[str]:
-    """Return phytochemicals whose fruit_vegetables list contains this plant.
+    """Phytochemicals whose fruit_vegetables list contains this plant.
 
-    Matching is case-insensitive and word-level: a source food matches when it
-    equals the plant, or one name's word set is a subset of the other's (so
-    "Onion" matches "Red Onion" but "Pea" does not match "Peach").
+    Word-level, case-insensitive matching — see plant_lookup.match_plant.
     """
-    client = await get_supabase()
-    resp = (
-        await client.table("phytochemical_sources")
-        .select("phytochemical_name,fruit_vegetables")
-        .execute()
-    )
-
-    plant_l = plant_name.strip().lower()
-    plant_tokens = _tokens(plant_name)
-    matches: list[str] = []
-    seen: set[str] = set()
-
-    for row in resp.data or []:
-        name = (row.get("phytochemical_name") or "").strip()
-        if not name or name.lower() in seen:
-            continue
-        for fv in row.get("fruit_vegetables") or []:
-            fvl = str(fv).strip().lower()
-            if not fvl:
-                continue
-            fv_tokens = _tokens(fvl)
-            if (
-                fvl == plant_l
-                or (fv_tokens and fv_tokens <= plant_tokens)
-                or (plant_tokens and plant_tokens <= fv_tokens)
-            ):
-                matches.append(name)
-                seen.add(name.lower())
-                break
-
-    return matches
+    rows = await plant_lookup.fetch_phytochemical_sources()
+    return plant_lookup.match_plant(rows, plant_name).phytochemicals
 
 
 async def _fetch_pathways(
@@ -369,10 +331,4 @@ def _index_pathways(
 
 
 def _grade(count: int) -> str:
-    if count >= _GRADE_A_MIN:
-        return "A"
-    if count >= _GRADE_B_MIN:
-        return "B"
-    if count >= _GRADE_C_MIN:
-        return "C"
-    return "None"
+    return plant_lookup.grade_from_pmid_count(count)

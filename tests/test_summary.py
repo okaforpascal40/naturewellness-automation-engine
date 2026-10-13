@@ -134,6 +134,19 @@ def test_prompt_carries_the_guardrails(
     assert call["max_tokens"] <= 300
 
 
+def test_prompt_asks_for_editorial_style_with_em_dashes(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    _install_sdk(monkeypatch, _Message([_Block("ok")]))
+    client.post("/api/v1/summary", json=PAYLOAD)
+
+    call = _FakeClient.last.messages.calls[0]
+    for text in (call["system"], call["messages"][0]["content"]):
+        assert "flowing editorial style using em-dashes (—)" in text
+        assert "varied sentence lengths" in text
+        assert "natural paragraph breaks" in text
+
+
 def test_second_identical_request_is_served_from_cache(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:

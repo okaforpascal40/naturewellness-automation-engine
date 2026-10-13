@@ -33,8 +33,11 @@ _CACHE_MAX = 500
 _SYSTEM = (
     "You are a nutrition science communicator writing for a general audience. "
     "You never claim that a food cures, treats or prevents disease. You write "
-    "in plain language using hedged phrasing such as 'may support', 'evidence "
-    "suggests' and 'associated with'. You never use bullet points or headings."
+    "in clear, accessible language using hedged phrasing such as 'may support', "
+    "'evidence suggests' and 'associated with'. Write in a flowing editorial "
+    "style using em-dashes (—) for parenthetical phrases, varied sentence "
+    "lengths, and natural paragraph breaks. You never use bullet points or "
+    "headings."
 )
 
 
@@ -88,16 +91,18 @@ def _cache_key(req: SummaryRequest) -> str:
 
 def _build_prompt(req: SummaryRequest) -> str:
     return (
-        "Write a 3-sentence plain English summary for a general audience about "
+        "Write a short editorial summary for a general audience about "
         f"how these plant foods may support {req.disease_name} management "
         "through their phytochemicals.\n\n"
         f"Top foods: {', '.join(req.top_foods[:5]) or 'not specified'}\n"
         f"Key phytochemicals: {', '.join(req.top_phytochemicals[:3]) or 'not specified'}\n"
         f"Gene targets: {', '.join(req.top_genes[:3]) or 'not specified'}\n"
         f"Evidence strength: {req.evidence_grade or 'mixed'}\n\n"
-        "Write in simple language. Never claim cure or treatment. Use phrases "
-        "like 'may support', 'evidence suggests', 'associated with'. Keep it "
-        "under 80 words. No bullet points. Return only the summary text."
+        "Write in a flowing editorial style using em-dashes (—) for "
+        "parenthetical phrases, varied sentence lengths, and natural paragraph "
+        "breaks. Never claim cure or treatment. Use phrases like 'may support', "
+        "'evidence suggests', 'associated with'. Keep it under 80 words. No "
+        "bullet points or headings. Return only the summary text."
     )
 
 

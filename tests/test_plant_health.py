@@ -169,6 +169,23 @@ class TestIdentificationStillWorks:
 
         assert normalized == {"is_plant": False}
 
+    def test_food_item_below_plantid_binary_cutoff_is_accepted(self) -> None:
+        # Tiger nuts, dates, etc. come back with binary False but a usable
+        # probability and species suggestion.
+        payload = _plant_result()
+        payload["result"]["is_plant"] = {"binary": False, "probability": 0.3}
+
+        normalized = _normalize_response(payload)
+
+        assert normalized["is_plant"] is True
+        assert normalized["plant_name"] == "Basil"
+
+    def test_near_certain_non_plant_is_rejected(self) -> None:
+        payload = _plant_result()
+        payload["result"]["is_plant"] = {"binary": False, "probability": 0.05}
+
+        assert _normalize_response(payload) == {"is_plant": False}
+
 
 class TestCredentialErrors:
     """The 401 path — where a bare status code cost real debugging time."""

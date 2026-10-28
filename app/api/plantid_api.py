@@ -22,6 +22,12 @@ _DEFAULT_URL = "https://crop.kindwise.com/api/v1/identification"
 # flag it as low-confidence so the UI can warn the user.
 _LOW_CONFIDENCE_THRESHOLD = 0.2
 
+# Plant.id's own `is_plant.binary` flag cuts off around 0.5, which rejects food
+# items — tiger nuts, dates, tubers, dried hibiscus — that it still classifies
+# well. We gate on the probability instead, and only turn away near-certain
+# non-plants.
+_MIN_IS_PLANT_PROBABILITY = 0.1
+
 # Health-assessment tuning.
 _MAX_CONDITIONS = 5
 _MIN_CONDITION_PROBABILITY = 0.1   # below 10% the suggestion is noise
@@ -98,7 +104,8 @@ async def identify_plant(
         }
 
     Behaviour:
-        - is_plant.binary is False  → {"is_plant": False}
+        - is_plant.probability < 0.1 (or binary False when no
+          probability is reported) → {"is_plant": False}
         - confidence < 0.2          → result with "low_confidence": True
         - API / network errors      → raises RuntimeError with a clear message
     """
@@ -158,9 +165,16 @@ def _normalize_response(payload: dict[str, Any]) -> dict[str, Any]:
     """Map a raw Plant.id response into the CamScan result shape."""
     result = payload.get("result") or {}
 
-    # is_plant gate — the API reports a binary flag plus a probability.
+    # is_plant gate — the API reports a binary flag plus a probability. Prefer
+    # the probability with our permissive threshold; the binary flag is only
+    # the fallback when no probability is reported.
     is_plant_info = result.get("is_plant") or {}
-    if is_plant_info.get("binary") is False:
+    is_plant_probability = is_plant_info.get("probability")
+    if is_plant_probability is not None:
+        if _safe_float(is_plant_probability, 0.0) < _MIN_IS_PLANT_PROBABILITY:
+            logger.info("Plant.id: image is not a plant (p=%s)", is_plant_probability)
+            return {"is_plant": False}
+    elif is_plant_info.get("binary") is False:
         logger.info("Plant.id: image is not a plant")
         return {"is_plant": False}
 
